@@ -37,6 +37,8 @@
 
 void	usage();
 void	exec_userfile(char *execfile, int id, char **envp);
+int	name_to_id(char *modname);
+void	do_unload(int id, char *modname, char *exectfile, char *envp[]);
 
 extern void fatal(char *fmt, ...);
 extern void error(char *fmt, ...);
@@ -47,15 +49,11 @@ extern void error(char *fmt, ...);
 int
 main(int argc, char *argv[], char *envp[])
 {
-	int child;
-	int status;
-	int id;
+	int i;
+	int id = -1;
 	char *execfile = NULL;
 	int opt;
 	extern char *optarg;
-
-	if (argc < 3)
-		usage();
 
 	while ((opt = getopt(argc, argv, "i:e:")) != -1) {
 		switch (opt) {
@@ -71,6 +69,64 @@ main(int argc, char *argv[], char *envp[])
 	if (getzoneid() != GLOBAL_ZONEID) {
 		fatal("modunload can only be run from the global zone\n");
 	}
+
+	if (id >= 0) {
+		do_unload(id, NULL, execfile, envp);
+	} else if (optind >= argc) {
+		/* Eiter pass id with -i, or a module name as arg. Or both. */
+		usage();
+	}
+
+	/*
+	 * If id is not specified explicitly, we loop over
+	 * the given module names.
+	 */
+	for (i = optind; i < argc; i++) {
+		id = name_to_id(argv[i]);
+		if (id < 0) {
+			fprintf(stderr, "Module '%s' not loaded\n", argv[i]);
+			continue;
+		}
+
+		do_unload(id, argv[i], execfile, envp);
+	}
+
+	return (0); /* success */
+}
+
+int
+name_to_id(char *modname)
+{
+	struct modinfo modinfo;
+	int id = -1;
+
+	modinfo.mi_id = modinfo.mi_nextid = id = -1;
+	modinfo.mi_info = MI_INFO_ALL | MI_INFO_CNT;
+
+	for (;;) {
+		if (modctl(MODINFO, id, &modinfo) < 0)
+			break;
+
+		id = modinfo.mi_id;
+
+		if (!(modinfo.mi_state & MI_LOADED))
+			continue;
+
+		if (!(strncmp(modinfo.mi_name, modname, MODMAXNAMELEN)))
+			return (id);
+	}
+
+	return (-1);
+}
+
+/*
+ * Unload a module. Optionally, run execfile.
+ */
+void
+do_unload(int id, char *modname, char *execfile, char *envp[])
+{
+	int child;
+	int status;
 
 	if (execfile) {
 		child = fork();
@@ -88,17 +144,22 @@ main(int argc, char *argv[], char *envp[])
 		}
 	}
 
-	/*
-	 * Unload the module.
-	 */
 	if (modctl(MODUNLOAD, id) < 0) {
-		if (errno == EPERM)
-			fatal("Insufficient privileges to unload a module\n");
-		else if (id != 0)
-			error("can't unload the module");
+		if (errno == EPERM) {
+			fatal("Insufficient privileges to"
+					"unload a module\n");
+		} else if (id != 0) {
+			if (modname) {
+				fprintf(stderr,
+					"can't unload module '%s': %s\n",
+					modname, strerror(errno));
+			} else {
+				fprintf(stderr,
+					"can't unload module (id %d): %s\n",
+					id, strerror(errno));
+			}
+		}
 	}
-
-	return (0);			/* success */
 }
 
 /*
@@ -129,5 +190,6 @@ exec_userfile(char *execfile, int id, char **envp)
 void
 usage()
 {
-	fatal("usage:  modunload -i <module_id> [-e <exec_file>]\n");
+	fatal("usage: modunload [-i <module_id>]"
+		"[-e <exec_file>] [module_name ... ]\n");
 }
