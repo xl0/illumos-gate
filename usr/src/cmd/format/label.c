@@ -521,7 +521,8 @@ get_disk_info_from_devid(int fd, struct efi_info *label)
 		return (-1);
 	}
 
-	if (dkinfo.dki_ctype != DKC_DIRECT)
+	if (dkinfo.dki_ctype != DKC_DIRECT &&
+	    dkinfo.dki_ctype != DKC_BLKDEV)
 		return (-1);
 
 	vid = s+12;
