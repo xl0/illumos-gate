@@ -153,6 +153,7 @@ struct vioblk_softc {
 	kmutex_t		lock_devid;
 	kcondvar_t		cv_devid;
 	char			devid[VIRTIO_BLK_ID_BYTES + 1];
+	ddi_dma_attr_t		sc_bd_dma_attr;
 };
 
 static int vioblk_read(void *arg, bd_xfer_t *xfer);
@@ -220,34 +221,34 @@ ddi_device_acc_attr_t vioblk_attr = {
 
 /* DMA attr for the header/status blocks. */
 static ddi_dma_attr_t vioblk_req_dma_attr = {
-	DMA_ATTR_V0,			/* dma_attr version	*/
-	0,				/* dma_attr_addr_lo	*/
-	0xFFFFFFFFFFFFFFFFull,		/* dma_attr_addr_hi	*/
-	0x00000000FFFFFFFFull,		/* dma_attr_count_max	*/
-	1,				/* dma_attr_align	*/
-	1,				/* dma_attr_burstsizes	*/
-	1,				/* dma_attr_minxfer	*/
-	0xFFFFFFFFull,			/* dma_attr_maxxfer	*/
-	0xFFFFFFFFFFFFFFFFull,		/* dma_attr_seg		*/
-	1,				/* dma_attr_sgllen	*/
-	1,				/* dma_attr_granular	*/
-	0,				/* dma_attr_flags	*/
+	DMA_ATTR_V0,		/* dma_attr version	*/
+	0,			/* dma_attr_addr_lo	*/
+	0xFFFFFFFFFFFFFFFFull,	/* dma_attr_addr_hi	*/
+	0x00000000FFFFFFFFull,	/* dma_attr_count_max	*/
+	1,			/* dma_attr_align	*/
+	1,			/* dma_attr_burstsizes	*/
+	1,			/* dma_attr_minxfer	*/
+	0xFFFFFFFFull,		/* dma_attr_maxxfer	*/
+	0xFFFFFFFFFFFFFFFFull,	/* dma_attr_seg		*/
+	1,			/* dma_attr_sgllen	*/
+	1,			/* dma_attr_granular	*/
+	0,			/* dma_attr_flags	*/
 };
 
 /* DMA attr for the data blocks. */
-static ddi_dma_attr_t vioblk_bd_dma_attr = {
-	DMA_ATTR_V0,			/* dma_attr version	*/
-	0,				/* dma_attr_addr_lo	*/
-	0xFFFFFFFFFFFFFFFFull,		/* dma_attr_addr_hi	*/
-	0x00000000FFFFFFFFull,		/* dma_attr_count_max	*/
-	1,				/* dma_attr_align	*/
-	1,				/* dma_attr_burstsizes	*/
-	1,				/* dma_attr_minxfer	*/
-	0,				/* dma_attr_maxxfer, set in attach */
-	0xFFFFFFFFFFFFFFFFull,		/* dma_attr_seg		*/
-	0,				/* dma_attr_sgllen, set in attach */
-	1,				/* dma_attr_granular	*/
-	0,				/* dma_attr_flags	*/
+static ddi_dma_attr_t vioblk_bd_dma_attr_template = {
+	DMA_ATTR_V0,		/* dma_attr version	*/
+	0,			/* dma_attr_addr_lo	*/
+	0xFFFFFFFFFFFFFFFFull,	/* dma_attr_addr_hi	*/
+	0x00000000FFFFFFFFull,	/* dma_attr_count_max	*/
+	1,			/* dma_attr_align	*/
+	1,			/* dma_attr_burstsizes	*/
+	1,			/* dma_attr_minxfer	*/
+	0,			/* dma_attr_maxxfer, set in attach */
+	0xFFFFFFFFFFFFFFFFull,	/* dma_attr_seg		*/
+	0,			/* dma_attr_sgllen, set in attach */
+	1,			/* dma_attr_granular	*/
+	0,			/* dma_attr_flags	*/
 };
 
 static int
@@ -460,7 +461,7 @@ vioblk_devid_init(void *arg, dev_info_t *devinfo, ddi_devid_t *devid)
 	(void) memset(&xfer, 0, sizeof (bd_xfer_t));
 	xfer.x_nblks = 1;
 
-	ret = ddi_dma_alloc_handle(sc->sc_dev, &vioblk_bd_dma_attr,
+	ret = ddi_dma_alloc_handle(sc->sc_dev, &sc->sc_bd_dma_attr,
 	    DDI_DMA_SLEEP, NULL, &xfer.x_dmah);
 	if (ret != DDI_SUCCESS)
 		goto out_alloc;
@@ -829,6 +830,13 @@ vioblk_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	mutex_init(&sc->lock_devid, NULL, MUTEX_DRIVER, NULL);
 
 	/*
+	 * We have per-instance dma attrs, because potentially, each
+	 * device could have different maxxfer and sgllen.
+	 */
+	memcpy(&sc->sc_bd_dma_attr, &vioblk_bd_dma_attr_template,
+	    sizeof (vioblk_bd_dma_attr_template));
+
+	/*
 	 * Initialize interrupt kstat.  This should not normally fail, since
 	 * we don't use a persistent stat.  We do it this way to avoid having
 	 * to test for it at run time on the hot path.
@@ -928,7 +936,7 @@ vioblk_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 		sc->sc_seg_max += 2;
 	}
 	/* 2 descriptors taken for header/status */
-	vioblk_bd_dma_attr.dma_attr_sgllen = sc->sc_seg_max - 2;
+	sc->sc_bd_dma_attr.dma_attr_sgllen = sc->sc_seg_max - 2;
 
 
 	/* The maximum size for a cookie in a request. */
@@ -939,15 +947,15 @@ vioblk_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	}
 
 	/* The maximum request size */
-	vioblk_bd_dma_attr.dma_attr_maxxfer =
-	    vioblk_bd_dma_attr.dma_attr_sgllen * sc->sc_seg_size_max;
+	sc->sc_bd_dma_attr.dma_attr_maxxfer =
+	    sc->sc_bd_dma_attr.dma_attr_sgllen * sc->sc_seg_size_max;
 
 	dev_debug(devinfo, CE_NOTE,
 	    "nblks=%lu blksize=%d  num_seg=%d, seg_size=%d, maxxfer=%lu",
 	    sc->sc_nblks, sc->sc_blk_size,
-	    vioblk_bd_dma_attr.dma_attr_sgllen,
+	    sc->sc_bd_dma_attr.dma_attr_sgllen,
 	    sc->sc_seg_size_max,
-	    vioblk_bd_dma_attr.dma_attr_maxxfer);
+	    sc->sc_bd_dma_attr.dma_attr_maxxfer);
 
 
 	sc->sc_vq = virtio_alloc_vq(&sc->sc_virtio, 0, 0,
@@ -961,7 +969,7 @@ vioblk_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 		goto exit_alloc2;
 	}
 
-	sc->bd_h = bd_alloc_handle(sc, &vioblk_ops, &vioblk_bd_dma_attr,
+	sc->bd_h = bd_alloc_handle(sc, &vioblk_ops, &sc->sc_bd_dma_attr,
 	    KM_SLEEP);
 	if (sc->bd_h == NULL) {
 		dev_err(devinfo, CE_WARN, "Failed to allocate blkdev");
