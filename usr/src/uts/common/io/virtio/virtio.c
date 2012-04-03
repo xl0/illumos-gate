@@ -126,9 +126,15 @@ virtio_show_features(uint32_t features,
 
 	/* LINTED E_PTRDIFF_OVERFLOW */
 	buf += snprintf(buf, bufend - buf, "Generic ( ");
+	if (features & VIRTIO_F_NOTIFY_ON_EMPTY)
+		/* LINTED E_PTRDIFF_OVERFLOW */
+		buf += snprintf(buf, bufend - buf, "NOTIFY_ON_EMPTY ");
 	if (features & VIRTIO_F_RING_INDIRECT_DESC)
 		/* LINTED E_PTRDIFF_OVERFLOW */
 		buf += snprintf(buf, bufend - buf, "INDIRECT_DESC ");
+	if (features & VIRTIO_F_RING_EVENT_IDX)
+		/* LINTED E_PTRDIFF_OVERFLOW */
+		buf += snprintf(buf, bufend - buf, "EVENT_IDX ");
 
 	/* LINTED E_PTRDIFF_OVERFLOW */
 	buf += snprintf(buf, bufend - buf, ") ");

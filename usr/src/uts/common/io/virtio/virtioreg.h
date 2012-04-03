@@ -86,6 +86,7 @@
 
 #define	VIRTIO_F_NOTIFY_ON_EMPTY		(1<<24)
 #define	VIRTIO_F_RING_INDIRECT_DESC		(1<<28)
+#define	VIRTIO_F_RING_EVENT_IDX			(1<<29)
 #define	VIRTIO_F_BAD_FEATURE			(1<<30)
 
 #define	VIRTIO_CONFIG_QUEUE_ADDRESS		8 /* 32bit */
@@ -119,6 +120,7 @@
  * (otherwise read-only).
  */
 #define	VRING_DESC_F_WRITE	2
+
 /* This means the buffer contains a list of buffer descriptors. */
 #define	VRING_DESC_F_INDIRECT	4
 
