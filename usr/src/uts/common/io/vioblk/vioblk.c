@@ -85,7 +85,7 @@
 #define	DEF_MAXINDIRECT		(128)
 #define	DEF_MAXSECTOR		(4096)
 
-#define	VIOBLK_POISON		0xdead0001dead0001
+#define	VIOBLK_POISON		0xdeadb10cdeadb10c
 
 /*
  * Static Variables.
