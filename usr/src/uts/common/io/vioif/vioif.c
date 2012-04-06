@@ -255,8 +255,13 @@ struct vioif_softc {
 	struct virtqueue	*sc_tx_vq;
 	struct virtqueue	*sc_ctrl_vq;
 
-	int			sc_stopped:1;
-	int			sc_tx_stopped:1;
+	unsigned int		sc_stopped:1;
+	unsigned int		sc_tx_stopped:1;
+
+	/* Feature bits. */
+	unsigned int 		sc_rx_csum;
+	unsigned int 		sc_tx_csum;
+
 	int 			sc_mtu;
 	uint8_t			sc_mac[ETHERADDRL];
 	/*
@@ -860,10 +865,9 @@ vioif_send(struct vioif_softc *sc, mblk_t *mp)
 	struct vioif_buf *buf;
 	struct vq_entry *first_ve;
 	struct vq_entry *tmp_ve;
-
+	struct virtio_net_hdr *net_header;
 	struct vioif_buf *first_buf;
 	size_t msg_size = 0;
-	unsigned int ncookies;
 	int frag_count = 0;
 	mblk_t *nmp;
 	int ret;
@@ -908,6 +912,38 @@ vioif_send(struct vioif_softc *sc, mblk_t *mp)
 	/* Use the inline buffer of the first entry for the virtio_net_hdr. */
 	(void) memset(buf->b_buf, 0, sizeof (struct virtio_net_hdr));
 
+	if (sc->sc_tx_csum) {
+
+		uint32_t csum_start;
+		uint32_t csum_stuff;
+		uint32_t csum_flags;
+
+		mac_hcksum_get(mp, &csum_start, &csum_stuff, NULL,
+		    NULL, &csum_flags);
+
+		/* They want us to do the TCP/UDP csum calculation. */
+		if (csum_flags & HCK_PARTIALCKSUM) {
+			struct ether_header *eth_header;
+			int eth_hsize;
+
+			/* We only asked for partial csum packets. */
+			ASSERT(!(csum_flags & HCK_IPV4_HDRCKSUM));
+			ASSERT(!(csum_flags & HCK_FULLCKSUM));
+
+			eth_header = (void *) mp->b_rptr;
+			if (eth_header->ether_type == htons(ETHERTYPE_VLAN)) {
+				eth_hsize = sizeof (struct ether_vlan_header);
+			} else {
+				eth_hsize = sizeof (struct ether_header);
+			}
+
+			net_header = (struct virtio_net_hdr *)buf->b_buf;
+			net_header->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+			net_header->csum_start = eth_hsize + csum_start;
+			net_header->csum_offset = csum_stuff - csum_start;
+		}
+	}
+
 	virtio_ve_add_indirect_buf(first_ve, buf->b_dmac.dmac_laddress,
 	    sizeof (struct virtio_net_hdr), B_TRUE);
 
@@ -926,6 +962,7 @@ vioif_send(struct vioif_softc *sc, mblk_t *mp)
 		nmp = mp;
 		/* Remember the mp to free it when the packet is sent. */
 		buf->b_mp = mp;
+		ve = first_ve;
 
 		while (nmp) {
 			size_t len;
@@ -1091,29 +1128,43 @@ vioif_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 }
 #endif
 
+static boolean_t
+vioif_getcapab(void *arg, mac_capab_t cap, void *cap_data)
+{
+	struct vioif_softc *sc = arg;
+
+	switch (cap) {
+	case MAC_CAPAB_HCKSUM:
+		if (sc->sc_tx_csum) {
+			uint32_t *txflags = cap_data;
+
+			*txflags = HCKSUM_INET_PARTIAL;
+			return (B_TRUE);
+		}
+		return (B_FALSE);
+	}
+
+	return (B_FALSE);
+}
 
 static mac_callbacks_t vioif_m_callbacks = {
-	0, /* MC_SETPROP | MC_GETPROP | MC_PROPINFO,*/
-	vioif_stat,
-	vioif_start,
-	vioif_stop,
-	vioif_promisc,
-	vioif_multicst,
-	vioif_unicst,
-	vioif_tx,
-	NULL,		/* reserved */
-	NULL,		/* mc_ioctl */
-	NULL,		/* mc_getcapab */
-	NULL,		/* mc_open */
-	NULL,		/* mc_close */
-	NULL,
-	NULL,
-	NULL
-/*
-	vioif_setprop,
-	vioif_getprop,
-	vioif_propinfo,
-*/
+	.mc_callbacks	= MC_GETCAPAB,
+	.mc_getstat	= vioif_stat,
+	.mc_start	= vioif_start,
+	.mc_stop	= vioif_stop,
+	.mc_setpromisc	= vioif_promisc,
+	.mc_multicst	= vioif_multicst,
+	.mc_unicst	= vioif_unicst,
+	.mc_tx		= vioif_tx,
+	/* Optional callbacks */
+	.mc_reserved	= NULL,		/* reserved */
+	.mc_ioctl	= NULL,		/* mc_ioctl */
+	.mc_getcapab	= vioif_getcapab,		/* mc_getcapab */
+	.mc_open	= NULL,		/* mc_open */
+	.mc_close	= NULL,		/* mc_close */
+	.mc_setprop	= NULL,
+	.mc_getprop	= NULL,
+	.mc_propinfo	= NULL,
 };
 
 static void
@@ -1319,6 +1370,36 @@ vioif_register_ints(struct vioif_softc *sc)
 	return (ret);
 }
 
+
+static void vioif_check_features(struct vioif_softc *sc)
+{
+	if (vioif_has_feature(sc, VIRTIO_NET_F_CSUM)) {
+		/* The GSO/GRO featured depend on CSUM, check them here. */
+
+		/*
+		 * Linux only checks for VIRTIO_NET_F_CSUM, so it's safe to
+		 * assume that they always come together. If not, we'd like
+		 * to know about it.
+		 */
+#if 0
+		if (!vioif_has_feature(sc, VIRTIO_NET_F_GUEST_CSUM)) {
+			dev_err(sc->sc_dev, CE_NOTE,
+			    "CSUM but !GUEST_CSUM. This is unexpected,"
+			    " not using hardware checksumming.");
+			goto exit_no_guest_csum;
+		}
+#endif
+		cmn_err(CE_NOTE, "Csum enabled.");
+
+		sc->sc_tx_csum = 1;
+		sc->sc_rx_csum = 1;
+	}
+	cmn_err(CE_NOTE, "Csum not enabled");
+
+exit_no_guest_csum:
+	;
+}
+
 static int
 vioif_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 {
@@ -1434,6 +1515,8 @@ vioif_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	/* XXX Make this configurable. */
 	sc->sc_rxcopy_thresh = 300;
 	sc->sc_txcopy_thresh = 300;
+
+	vioif_check_features(sc);
 
 	if (vioif_alloc_mems(sc))
 		goto exit_alloc_mems;
