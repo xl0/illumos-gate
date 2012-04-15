@@ -132,8 +132,6 @@ struct virtio_net_hdr {
 #define	VIRTIO_NET_HDR_GSO_TCPV6	4 /* gso_type */
 #define	VIRTIO_NET_HDR_GSO_ECN		0x80 /* gso_type, |'ed */
 
-#define ETHER_HEADER_LEN		sizeof (struct ether_header)
-#define	VIRTIO_NET_MAX_GSO_LEN		(65536 + ETHER_HEADER_LEN)
 
 /* Control virtqueue */
 struct virtio_net_ctrl_cmd {
@@ -212,36 +210,46 @@ ddi_device_acc_attr_t vioif_attr = {
 };
 
 
+
 /*
- * A vioif_buf can carry an "inline" buffer (for small pakets) and
- * a bigger, "mapped" buffer used for bigger packets. Both are optional, e.g.
- * an rx vioif_buf carries only the "mapped", buffer to be able to hold GRO
- * packets. For large packets, the rx vioif_buf is loaned upstream, while
- * smaller packets get copied and the buffer is reused immediately.
- *
- * A tx vioif_buf always carries an inline buffer, which is used to hold the
- * data in case we send a small packet. Bigger packets are mapped, and linked
- * using the "mapped buffer" fields. They are sent out using
- * indirect virtio queue entries.
+ * A mapping represents a binding for a single buffer that is contiguous in the
+ * virtual address space.
  */
-struct vioif_buf {
-	struct vioif_softc	*b_sc;
-	frtn_t			b_frtn;
-	/* Pointer to a message block, used for tx only. */
-	mblk_t			*b_mp;
+struct vioif_buf_mapping {
+	caddr_t			vbm_buf;
+	ddi_dma_handle_t	vbm_dmah;
+	ddi_acc_handle_t	vbm_acch;
+	ddi_dma_cookie_t	vbm_dmac;
+	unsigned int		vbm_ncookies;
+};
+
+/* Rx buffers can be loaned upstream, so the code has to allocate them dynamically. */
+struct vioif_rx_buf {
+	struct vioif_softc	*rb_sc;
+	frtn_t			rb_frtn;
+
+	struct vioif_buf_mapping rb_mapping;
+};
+
+/*
+ * Tx buffers have two mapping types. One, "inline", is pre-allocated and is
+ * used to hold the virtio_net_header. Small packets also get copied there, as
+ * it's faster then mapping them. Bigger packets get mapped using the "external"
+ * mapping array. An array is used, because a packet may consist of muptiple
+ * fragments, so each fragment gets bound to an entry. According to my
+ * observations, the number of fragments does not exceed 2, but just in case,
+ * a bigger, up to VIOIF_INDIRECT_MAX - 1 array is allocated. To save resources,
+ * the dma handles are allocated lazily in the tx path.
+ */
+struct vioif_tx_buf {
+	mblk_t			*tb_mp;
 
 	/* inline buffer */
-	caddr_t			b_buf;
-	ddi_dma_handle_t	b_dmah;
-	ddi_acc_handle_t	b_acch;
-	ddi_dma_cookie_t	b_dmac;
+	struct vioif_buf_mapping tb_inline_mapping;
 
-	/* mapped buffer */
-	caddr_t			b_mapped_buf;
-	ddi_dma_handle_t	b_mapped_dmah;
-	ddi_acc_handle_t	b_mapped_acch;
-	ddi_dma_cookie_t	b_mapped_dmac;
-	unsigned int		b_mapped_ncookies;
+	/* External buffers */
+	struct vioif_buf_mapping *tb_external_mapping;
+	unsigned int		tb_external_num;
 };
 
 struct vioif_softc {
@@ -259,8 +267,8 @@ struct vioif_softc {
 	unsigned int		sc_tx_stopped:1;
 
 	/* Feature bits. */
-	unsigned int 		sc_rx_csum;
-	unsigned int 		sc_tx_csum;
+	unsigned int 		sc_rx_csum:1;
+	unsigned int 		sc_tx_csum:1;
 
 	int 			sc_mtu;
 	uint8_t			sc_mac[ETHERADDRL];
@@ -269,17 +277,18 @@ struct vioif_softc {
 	 * can be loaned upstream, and we have to repopulate the array with
 	 * new members.
 	 */
-	struct vioif_buf	**sc_rxbufs;
+	struct vioif_rx_buf	**sc_rxbufs;
 
 	/*
-	 * For tx , we just allocate an array of buffers. The packet can
-	 * either be copied into buf[i].b_buf, or the buffer could be used
-	 * to map the packet */
-	struct vioif_buf	*sc_txbufs;
+	 * For tx, we just allocate an array of buffers. The packet can
+	 * either be copied into the inline buffer, or the external mapping
+	 * could be used to map the packet
+	 */
+	struct vioif_tx_buf	*sc_txbufs;
 
 	kstat_t			*sc_intrstat;
 	/*
-	 * We "loan" the buffers upstream and reuse them after they are
+	 * We "loan" rx buffers upstream and reuse them after they are
 	 * freed. This lets us avoid allocations in the hot path.
 	 */
 	kmem_cache_t		*sc_rxbuf_cache;
@@ -290,20 +299,12 @@ struct vioif_softc {
 	unsigned int		sc_txcopy_thresh;
 };
 
-#define	ETHERVLANMTU    (ETHERMAX + 4)
+#define ETHER_HEADER_LEN		sizeof (struct ether_header)
 
+/* MTU + the ethernet header. */
+#define MAX_PAYLOAD	65535
+#define MAX_MTU		(MAX_PAYLOAD - ETHER_HEADER_LEN)
 #define	DEFAULT_MTU 	ETHERMTU
-#define	MAX_MTU 	65535
-
-/*
- * We win a bit on header alignment, but the host wins a lot
- * more on moving aligned buffers. Might need more thought.
- */
-#define	VIOIF_IP_ALIGN 0
-
-
-/* Maximum number of indirect descriptors, somewhat arbitrary. */
-#define VIOIF_INDIRECT_MAX 128
 
 /*
  * Yeah, we spend 8M per device. Turns out, there is no point
@@ -312,7 +313,17 @@ struct vioif_softc {
  * vhost in production environment.
  */
 /* The buffer keeps both the packet data and the virtio_net_header. */
-#define VIOIF_RX_SIZE (VIRTIO_NET_MAX_GSO_LEN + sizeof (struct virtio_net_hdr))
+#define VIOIF_RX_SIZE (MAX_PAYLOAD + sizeof (struct virtio_net_hdr))
+
+/*
+ * We win a bit on header alignment, but the host wins a lot
+ * more on moving aligned buffers. Might need more thought.
+ */
+#define	VIOIF_IP_ALIGN 0
+
+/* Maximum number of indirect descriptors, somewhat arbitrary. */
+#define VIOIF_INDIRECT_MAX 128
+
 
 /*
  * We pre-allocate a reasonably large buffer to copy small packets
@@ -420,13 +431,13 @@ static ddi_device_acc_attr_t vioif_bufattr = {
 	DDI_DEVICE_ATTR_V0,
 	DDI_NEVERSWAP_ACC,
 	DDI_STORECACHING_OK_ACC,
-	DDI_DEFAULT_ACC 
+	DDI_DEFAULT_ACC
 };
 
 static void vioif_rx_free(caddr_t free_arg)
 {
-	struct vioif_buf *buf = (void *) free_arg;
-	struct vioif_softc *sc = buf->b_sc;
+	struct vioif_rx_buf *buf = (void *) free_arg;
+	struct vioif_softc *sc = buf->rb_sc;
 
 	kmem_cache_free(sc->sc_rxbuf_cache, buf);
 	atomic_dec_ulong(&sc->sc_rxloan);
@@ -436,49 +447,47 @@ static void vioif_rx_free(caddr_t free_arg)
 static int vioif_rx_construct(void *buffer, void *user_arg, int kmflags)
 {
 	struct vioif_softc *sc = user_arg;
-	struct vioif_buf *buf = buffer;
+	struct vioif_rx_buf *buf = buffer;
 	unsigned int nsegments;
 	size_t len;
 
-	/* We don't allocate the "inline" buffer, only the mapped one. */
-
 	if (ddi_dma_alloc_handle(sc->sc_dev, &vioif_mapped_buf_dma_attr,
-	    DDI_DMA_SLEEP, NULL, &buf->b_mapped_dmah)) {
+	    DDI_DMA_SLEEP, NULL, &buf->rb_mapping.vbm_dmah)) {
 		dev_err(sc->sc_dev, CE_WARN,
 		    "Can't allocate dma handle for rx buffer");
 		goto exit_handle;
 	}
 
-	if (ddi_dma_mem_alloc(buf->b_mapped_dmah,
+	if (ddi_dma_mem_alloc(buf->rb_mapping.vbm_dmah,
 	    VIOIF_RX_SIZE + sizeof (struct virtio_net_hdr),
 	    &vioif_bufattr, DDI_DMA_STREAMING, DDI_DMA_SLEEP,
-	    NULL, &buf->b_mapped_buf, &len, &buf->b_mapped_acch)) {
+	    NULL, &buf->rb_mapping.vbm_buf, &len, &buf->rb_mapping.vbm_acch)) {
 		dev_err(sc->sc_dev, CE_WARN,
 		    "Can't allocate rx buffer");
 		goto exit_alloc;
 	}
 	ASSERT(len >= VIOIF_RX_SIZE);
 
-	if (ddi_dma_addr_bind_handle(buf->b_mapped_dmah, NULL,
-	    buf->b_mapped_buf, len, DDI_DMA_READ | DDI_DMA_STREAMING,
-	    DDI_DMA_SLEEP, NULL, &buf->b_mapped_dmac,
-	    &buf->b_mapped_ncookies)) {
+	if (ddi_dma_addr_bind_handle(buf->rb_mapping.vbm_dmah, NULL,
+	    buf->rb_mapping.vbm_buf, len, DDI_DMA_READ | DDI_DMA_STREAMING,
+	    DDI_DMA_SLEEP, NULL, &buf->rb_mapping.vbm_dmac,
+	    &buf->rb_mapping.vbm_ncookies)) {
 		dev_err(sc->sc_dev, CE_WARN, "Can't bind tx buffer");
 
 		goto exit_bind;
 	}
 
-	ASSERT(buf->b_mapped_ncookies <= VIOIF_INDIRECT_MAX);
+	ASSERT(buf->rb_mapping.vbm_ncookies <= VIOIF_INDIRECT_MAX);
 
-	buf->b_sc = sc;
-	buf->b_frtn.free_arg = (void *) buf;
-	buf->b_frtn.free_func = vioif_rx_free;
+	buf->rb_sc = sc;
+	buf->rb_frtn.free_arg = (void *) buf;
+	buf->rb_frtn.free_func = vioif_rx_free;
 
 	return (0);
 exit_bind:
-	ddi_dma_mem_free(&buf->b_mapped_acch);
+	ddi_dma_mem_free(&buf->rb_mapping.vbm_acch);
 exit_alloc:
-	ddi_dma_free_handle(&buf->b_mapped_dmah);
+	ddi_dma_free_handle(&buf->rb_mapping.vbm_dmah);
 exit_handle:
 
 	return (ENOMEM);
@@ -487,14 +496,14 @@ exit_handle:
 /* ARGSUSED */
 static void vioif_rx_destruct(void *buffer, void *user_arg)
 {
-	struct vioif_buf *buf = buffer;
+	struct vioif_rx_buf *buf = buffer;
 
-	ASSERT(buf->b_mapped_acch);
-	ASSERT(buf->b_mapped_dmah);
+	ASSERT(buf->rb_mapping.vbm_acch);
+	ASSERT(buf->rb_mapping.vbm_acch);
 
-	(void) ddi_dma_unbind_handle(buf->b_mapped_dmah);
-	ddi_dma_mem_free(&buf->b_mapped_acch);
-	ddi_dma_free_handle(&buf->b_mapped_dmah);
+	(void) ddi_dma_unbind_handle(buf->rb_mapping.vbm_dmah);
+	ddi_dma_mem_free(&buf->rb_mapping.vbm_acch);
+	ddi_dma_free_handle(&buf->rb_mapping.vbm_dmah);
 }
 
 static void
@@ -503,26 +512,40 @@ vioif_free_mems(struct vioif_softc *sc)
 	int i;
 
 	for (i = 0; i < sc->sc_tx_vq->vq_num; i++) {
-		struct vioif_buf *buf = &sc->sc_txbufs[i];
+		struct vioif_tx_buf *buf = &sc->sc_txbufs[i];
+		int j;
 
-		ASSERT(buf->b_acch);
-		ASSERT(buf->b_dmah);
+		/* Tear down the internal mapping. */
 
-		(void) ddi_dma_unbind_handle(buf->b_dmah);
-		ddi_dma_mem_free(&buf->b_acch);
-		ddi_dma_free_handle(&buf->b_dmah);
+		ASSERT(buf->tb_inline_mapping.vbm_acch);
+		ASSERT(buf->tb_inline_mapping.vbm_dmah);
+
+		(void) ddi_dma_unbind_handle(buf->tb_inline_mapping.vbm_dmah);
+		ddi_dma_mem_free(&buf->tb_inline_mapping.vbm_acch);
+		ddi_dma_free_handle(&buf->tb_inline_mapping.vbm_dmah);
+
+		/* We should not see any in-flight buffers at this point. */
+		ASSERT(!buf->tb_mp);
+
+		/* Free all the dma hdnales we allocated lazily. */
+		for (j = 0; buf->tb_external_mapping[j].vbm_dmah; j++)
+			ddi_dma_free_handle(
+			    &buf->tb_external_mapping[j].vbm_dmah);
+		/* Free the external mapping array. */
+		kmem_free(buf->tb_external_mapping,
+		    sizeof (struct vioif_tx_buf) * VIOIF_INDIRECT_MAX - 1);
 	}
 
-	kmem_free(sc->sc_txbufs, sizeof (struct vioif_buf) *
+	kmem_free(sc->sc_txbufs, sizeof (struct vioif_tx_buf) *
 	    sc->sc_tx_vq->vq_num);
 
 	for (i = 0; i < sc->sc_rx_vq->vq_num; i++) {
-		struct vioif_buf *buf = sc->sc_rxbufs[i];
+		struct vioif_rx_buf *buf = sc->sc_rxbufs[i];
 
 		if (buf)
 			kmem_cache_free(sc->sc_rxbuf_cache, buf);
 	}
-	kmem_free(sc->sc_rxbufs, sizeof (struct vioif_buf *) *
+	kmem_free(sc->sc_rxbufs, sizeof (struct vioif_rx_buf *) *
 	    sc->sc_rx_vq->vq_num);
 }
 
@@ -537,7 +560,7 @@ vioif_alloc_mems(struct vioif_softc *sc)
 	txqsize = sc->sc_tx_vq->vq_num;
 	rxqsize = sc->sc_rx_vq->vq_num;
 
-	sc->sc_txbufs = kmem_zalloc(sizeof (struct vioif_buf) * txqsize,
+	sc->sc_txbufs = kmem_zalloc(sizeof (struct vioif_tx_buf) * txqsize,
 	    KM_SLEEP);
 	if (!sc->sc_txbufs) {
 		dev_err(sc->sc_dev, CE_WARN,
@@ -550,7 +573,7 @@ vioif_alloc_mems(struct vioif_softc *sc)
 	 * rx vioif_bufs can be loaned upstream, and we don't know the
 	 * total number we need.
 	 */
-	sc->sc_rxbufs = kmem_zalloc(sizeof (struct vioif_buf *) * rxqsize,
+	sc->sc_rxbufs = kmem_zalloc(sizeof (struct vioif_rx_buf *) * rxqsize,
 	    KM_SLEEP);
 	if (!sc->sc_rxbufs) {
 		dev_err(sc->sc_dev, CE_WARN,
@@ -559,22 +582,23 @@ vioif_alloc_mems(struct vioif_softc *sc)
 	}
 
 	for (i = 0; i < txqsize; i++) {
-		struct vioif_buf *buf = &sc->sc_txbufs[i];
+		struct vioif_tx_buf *buf = &sc->sc_txbufs[i];
 
-		/* Allocate and bind an inline buffer and a DMA hande. */
+		/* Allocate and bind an inline mapping. */
 
 		if (ddi_dma_alloc_handle(sc->sc_dev,
 		    &vioif_inline_buf_dma_attr,
-		    DDI_DMA_SLEEP, NULL, &buf->b_dmah)) {
+		    DDI_DMA_SLEEP, NULL, &buf->tb_inline_mapping.vbm_dmah)) {
 
 			dev_err(sc->sc_dev, CE_WARN,
 			    "Can't allocate dma handle for tx buffer %d", i);
 			goto exit_tx;
 		}
 
-		if (ddi_dma_mem_alloc(buf->b_dmah, VIOIF_TX_INLINE_SIZE,
-		    &vioif_bufattr, DDI_DMA_STREAMING, DDI_DMA_SLEEP,
-		    NULL, &buf->b_buf, &len, &buf->b_acch)) {
+		if (ddi_dma_mem_alloc(buf->tb_inline_mapping.vbm_dmah,
+		    VIOIF_TX_INLINE_SIZE, &vioif_bufattr, DDI_DMA_STREAMING,
+		    DDI_DMA_SLEEP, NULL, &buf->tb_inline_mapping.vbm_buf,
+		    &len, &buf->tb_inline_mapping.vbm_acch)) {
 
 			dev_err(sc->sc_dev, CE_WARN,
 			    "Can't allocate tx buffer %d", i);
@@ -582,9 +606,10 @@ vioif_alloc_mems(struct vioif_softc *sc)
 		}
 		ASSERT(len >= VIOIF_TX_INLINE_SIZE);
 
-		if (ddi_dma_addr_bind_handle(buf->b_dmah, NULL, buf->b_buf,
-		    len, DDI_DMA_WRITE | DDI_DMA_STREAMING, DDI_DMA_SLEEP,
-		    NULL, &dmac, &nsegments)) {
+		if (ddi_dma_addr_bind_handle(buf->tb_inline_mapping.vbm_dmah,
+		    NULL, buf->tb_inline_mapping.vbm_buf, len,
+		    DDI_DMA_WRITE | DDI_DMA_STREAMING, DDI_DMA_SLEEP, NULL,
+		    &buf->tb_inline_mapping.vbm_dmac, &nsegments)) {
 
 			dev_err(sc->sc_dev, CE_WARN,
 			    "Can't bind tx buffer %d", i);
@@ -593,39 +618,50 @@ vioif_alloc_mems(struct vioif_softc *sc)
 
 		/* We asked for a single segment */
 		ASSERT(nsegments == 1);
-		buf->b_dmac = dmac;
 
-		/* Allocate a handle for the mapped buffer. */
-		if (ddi_dma_alloc_handle(sc->sc_dev,
-		    &vioif_mapped_buf_dma_attr,
-		    DDI_DMA_SLEEP, NULL, &buf->b_mapped_dmah)) {
-			dev_err(sc->sc_dev, CE_WARN,
-			    "Can't allocate the mapped dma"
-			    " handle for tx buffer %d", i);
-			goto exit_tx;
-		}
+		/*
+		 * We allow up to VIOIF_INDIRECT_MAX - 1 external mappings.
+		 * In reality, I don't expect more then 2-3 used, but who
+		 * knows.
+		 */
+		buf->tb_external_mapping = kmem_zalloc(
+		    sizeof (struct vioif_tx_buf) * VIOIF_INDIRECT_MAX - 1,
+		    KM_SLEEP);
+
+		/*
+		 * The external mapping's dma handles are allocate lazily,
+		 * as we don't expect most of them to be used..
+		 */
 	}
 
 	return (0);
 
 exit_tx:
 	for (i = 0; i < txqsize; i++) {
-		struct vioif_buf *buf = &sc->sc_txbufs[i];
+		struct vioif_tx_buf *buf = &sc->sc_txbufs[i];
 
-		if (buf->b_dmah)
-			(void) ddi_dma_unbind_handle(buf->b_dmah);
-		if (buf->b_acch)
-			ddi_dma_mem_free(&buf->b_acch);
-		if (buf->b_dmah)
-			ddi_dma_free_handle(&buf->b_dmah);
-		if (buf->b_mapped_dmah)
-			ddi_dma_free_handle(&buf->b_mapped_dmah);
+		if (buf->tb_inline_mapping.vbm_dmah)
+			(void) ddi_dma_unbind_handle(
+			    buf->tb_inline_mapping.vbm_dmah);
+
+		if (buf->tb_inline_mapping.vbm_acch)
+			ddi_dma_mem_free(
+			    &buf->tb_inline_mapping.vbm_acch);
+
+		if (buf->tb_inline_mapping.vbm_dmah)
+			ddi_dma_free_handle(
+			    &buf->tb_inline_mapping.vbm_dmah);
+
+		if (buf->tb_external_mapping)
+			kmem_free(buf->tb_external_mapping,
+			    sizeof (struct vioif_tx_buf) *
+			    VIOIF_INDIRECT_MAX - 1);
 	}
 
-	kmem_free(sc->sc_rxbufs, sizeof (struct vioif_buf) * rxqsize);
+	kmem_free(sc->sc_rxbufs, sizeof (struct vioif_rx_buf) * rxqsize);
 
 exit_rxalloc:
-	kmem_free(sc->sc_txbufs, sizeof (struct vioif_buf) * txqsize);
+	kmem_free(sc->sc_txbufs, sizeof (struct vioif_tx_buf) * txqsize);
 exit_txalloc:
 	return (ENOMEM);
 }
@@ -655,14 +691,8 @@ vioif_unicst(void *arg, const uint8_t *macaddr)
 static int vioif_add_rx(struct vioif_softc *sc, int kmflag)
 {
 	struct vq_entry *ve;
-	struct vioif_buf *buf;
-#if 0
-	ve_hdr = vq_alloc_entry(sc->sc_rx_vq);
-	if (!ve_hdr) {
-		/* Out of free descriptors - ring already full. */
-		goto exit_hdr;
-	}
-#endif
+	struct vioif_rx_buf *buf;
+
 	ve = vq_alloc_entry(sc->sc_rx_vq);
 	if (!ve) {
 		/* Out of free descriptors - ring already full. */
@@ -676,13 +706,13 @@ static int vioif_add_rx(struct vioif_softc *sc, int kmflag)
 		sc->sc_rxbufs[ve->qe_index] = buf;
 	}
 
-	/* Still nothing? Bue. */
+	/* Still nothing? Bye. */
 	if (!buf) {
 		dev_err(sc->sc_dev, CE_WARN, "Can't allocate rx buffer");
 		goto exit_buf;
 	}
 
-	ASSERT(buf->b_mapped_ncookies >= 1);
+	ASSERT(buf->rb_mapping.vbm_ncookies >= 1);
 
 #if 0
 	cmn_err(CE_NOTE, "Adding RX buffer:");
@@ -694,29 +724,32 @@ static int vioif_add_rx(struct vioif_softc *sc, int kmflag)
 	 * For an unknown reason, the virtio_net_hdr must be placed
 	 * as a separate virtio queue entry.
 	 */
-	virtio_ve_add_indirect_buf(ve, buf->b_mapped_dmac.dmac_laddress,
+	virtio_ve_add_indirect_buf(ve, buf->rb_mapping.vbm_dmac.dmac_laddress,
 	    sizeof (struct virtio_net_hdr), B_FALSE);
 
-	/* Add the rest of the buffer. */
+	/* Add the rest of the first cookie. */
 	virtio_ve_add_indirect_buf(ve,
-	    buf->b_mapped_dmac.dmac_laddress + sizeof (struct virtio_net_hdr),
-	    buf->b_mapped_dmac.dmac_size - sizeof (struct virtio_net_hdr),
-	    B_FALSE);
+	    buf->rb_mapping.vbm_dmac.dmac_laddress +
+	        sizeof (struct virtio_net_hdr),
+	    buf->rb_mapping.vbm_dmac.dmac_size -
+	        sizeof (struct virtio_net_hdr), B_FALSE);
 
 	/*
-	 * If the buffer consists on a single cookie (unlikely for a
+	 * If the buffer consists of a single cookie (unlikely for a
 	 * 64-k buffer), we are done. Otherwise, add the rest of the cookies
 	 * using indirect entries.
 	 */
-	if (buf->b_mapped_ncookies > 1) {
+	if (buf->rb_mapping.vbm_ncookies > 1) {
 		ddi_dma_cookie_t *first_extra_dmac;
 		ddi_dma_cookie_t dmac;
-		first_extra_dmac = vioif_dma_curr_cookie(buf->b_mapped_dmah);
+		first_extra_dmac =
+		    vioif_dma_curr_cookie(buf->rb_mapping.vbm_dmah);
 
-		ddi_dma_nextcookie(buf->b_mapped_dmah, &dmac);
-		virtio_ve_add_cookie(ve, buf->b_mapped_dmah,
-		    dmac, buf->b_mapped_ncookies - 1, B_FALSE);
-		vioif_dma_reset_cookie(buf->b_mapped_dmah, first_extra_dmac);
+		ddi_dma_nextcookie(buf->rb_mapping.vbm_dmah, &dmac);
+		virtio_ve_add_cookie(ve, buf->rb_mapping.vbm_dmah,
+		    dmac, buf->rb_mapping.vbm_ncookies - 1, B_FALSE);
+		vioif_dma_reset_cookie(buf->rb_mapping.vbm_dmah,
+		    first_extra_dmac);
 	}
 
 	virtio_push_chain(ve, B_FALSE);
@@ -754,7 +787,7 @@ static int vioif_populate_rx(struct vioif_softc *sc, int kmflag)
 static int vioif_process_rx(struct vioif_softc *sc)
 {
 	struct vq_entry *ve;
-	struct vioif_buf *buf;
+	struct vioif_rx_buf *buf;
 
 	mblk_t *mp;
 	uint32_t len;
@@ -767,7 +800,7 @@ static int vioif_process_rx(struct vioif_softc *sc)
 		ASSERT(buf);
 
 		if (len < sizeof (struct virtio_net_hdr)) {
-			cmn_err(CE_WARN, "Rx: Cnain too small: %u",
+			dev_err(sc->sc_dev, CE_WARN, "RX: Cnain too small: %u",
 			    len - (uint32_t) sizeof (struct virtio_net_hdr));
 			virtio_free_chain(ve);
 			continue;
@@ -780,7 +813,7 @@ static int vioif_process_rx(struct vioif_softc *sc)
 		 * the buffers upstream.
 		 */
 		if (len < sc->sc_rxcopy_thresh &&
-		    len == buf->b_mapped_dmac.dmac_size) {
+		    len < buf->rb_mapping.vbm_dmac.dmac_size) {
 			mp = allocb(len, 0);
 			if (!mp) {
 				cmn_err(CE_WARN, "Failed to allocale mblock!");
@@ -788,14 +821,15 @@ static int vioif_process_rx(struct vioif_softc *sc)
 				break;
 			}
 
-			bcopy((char *)buf->b_mapped_buf +
+			bcopy((char *)buf->rb_mapping.vbm_buf +
 			    sizeof (struct virtio_net_hdr), mp->b_rptr, len);
 			mp->b_wptr = mp->b_rptr + len;
 
 		} else {
-			mp = desballoc((unsigned char *)buf->b_mapped_buf +
+			mp = desballoc((unsigned char *)
+			    buf->rb_mapping.vbm_buf +
 			    sizeof (struct virtio_net_hdr) +
-			    VIOIF_IP_ALIGN, len, 0, &buf->b_frtn);
+			    VIOIF_IP_ALIGN, len, 0, &buf->rb_frtn);
 			if (!mp) {
 				cmn_err(CE_WARN, "Failed to allocale mblock!");
 				virtio_free_chain(ve);
@@ -821,33 +855,33 @@ static int vioif_process_rx(struct vioif_softc *sc)
 
 static void vioif_reclaim_used_tx(struct vioif_softc *sc)
 {
-	struct vq_entry *ve, *tmp_ve;
-	struct vioif_buf *buf;
+	struct vq_entry *ve;
+	struct vioif_tx_buf *buf;
 	uint32_t len;
 	mblk_t *mp;
 	int i = 0;
 
 	while ((ve = virtio_pull_chain(sc->sc_tx_vq, &len))) {
-		tmp_ve = ve;
+		/* We don't chain descriptors for tx, so don't expect any. */
+		ASSERT(!ve->qe_next);
 
 		buf = &sc->sc_txbufs[ve->qe_index];
-		mp = buf->b_mp;
+		mp = buf->tb_mp;
+		buf->tb_mp = NULL;
 
-		do {
-			buf = &sc->sc_txbufs[tmp_ve->qe_index];
-			/* If mapped buffer was used. */
-			if (buf->b_mp) {
-				ddi_dma_unbind_handle(buf->b_mapped_dmah);
-				buf->b_mp = NULL;
-			}
-			tmp_ve = tmp_ve->qe_next;
-		} while (tmp_ve);
+		if (mp) {
+			for (i = 0; i < buf->tb_external_num; i++)
+				ddi_dma_unbind_handle(
+				    buf->tb_external_mapping[i].vbm_dmah);
+		}
 
+		/* XXX Move after freemsg? */
 		virtio_free_chain(ve);
 
+
+		/* External mapping used, mp was not freed in vioif_send() */
 		if (mp)
 			freemsg(mp);
-
 		i++;
 	}
 
@@ -857,94 +891,191 @@ static void vioif_reclaim_used_tx(struct vioif_softc *sc)
 	}
 }
 
+/* sc will be used to update stat counters. */
+/* ARGSUSED */
+static inline void vioif_tx_inline(struct vioif_softc *sc, struct vq_entry *ve,
+    mblk_t *mp, size_t msg_size)
+{
+	struct vioif_tx_buf *buf;
+	buf = &sc->sc_txbufs[ve->qe_index];
+
+	ASSERT(buf);
+
+	/* Frees mp */
+	mcopymsg(mp, buf->tb_inline_mapping.vbm_buf +
+	     sizeof (struct virtio_net_hdr));
+
+	virtio_ve_add_indirect_buf(ve,
+	    buf->tb_inline_mapping.vbm_dmac.dmac_laddress +
+	    sizeof (struct virtio_net_hdr), msg_size, B_TRUE);
+}
+
+static inline int vioif_tx_lazy_handle_alloc(struct vioif_softc *sc,
+    struct vioif_tx_buf *buf, int i)
+{
+	int ret = DDI_SUCCESS;
+
+	if (!buf->tb_external_mapping[i].vbm_dmah) {
+		ret = ddi_dma_alloc_handle(sc->sc_dev,
+		    &vioif_mapped_buf_dma_attr, DDI_DMA_SLEEP, NULL,
+		    &buf->tb_external_mapping[i].vbm_dmah);
+		if (ret != DDI_SUCCESS) {
+			dev_err(sc->sc_dev, CE_WARN,
+			    "Can't allocate dma handle for external tx buffer");
+		}
+	}
+
+	return (ret);
+}
+
+static inline int vioif_tx_external(struct vioif_softc *sc, struct vq_entry *ve,
+    mblk_t *mp, size_t msg_size)
+{
+	struct vioif_tx_buf *buf;
+	mblk_t *nmp;
+	int i, j;
+	int ret = DDI_SUCCESS;
+
+	buf = &sc->sc_txbufs[ve->qe_index];
+
+	ASSERT(buf);
+
+	buf->tb_external_num = 0;
+	i = 0;
+	nmp = mp;
+
+	while (nmp) {
+		size_t len;
+		ddi_dma_cookie_t dmac;
+		unsigned int ncookies;
+
+		len = MBLKL(nmp);
+		/*
+		 * For some reason, the network stack can
+		 * actually send us zero-length fragments.
+		 */
+		if (len == 0) {
+			nmp = nmp->b_cont;
+			continue;
+		}
+
+		ret = vioif_tx_lazy_handle_alloc(sc, buf, i);
+		if (ret != DDI_SUCCESS)
+			goto exit_lazy_alloc;
+
+		ret = ddi_dma_addr_bind_handle(
+		   buf->tb_external_mapping[i].vbm_dmah, NULL,
+		   (caddr_t)nmp->b_rptr, len,
+		   DDI_DMA_WRITE | DDI_DMA_STREAMING,
+		   DDI_DMA_SLEEP, NULL, &dmac, &ncookies);
+
+		if (ret != DDI_SUCCESS) {
+			dev_err(sc->sc_dev, CE_NOTE,
+			    "TX: Failed to bind external handle");
+			goto exit_bind;
+		}
+
+		/* Check if we still fit into the indirect table. */
+		if (virtio_ve_indirect_available(ve) < ncookies) {
+			dev_err(sc->sc_dev, CE_NOTE,
+			    "TX: Indirect descriptor table limit reached."
+			    " It took %d fragments.", i);
+			ret = DDI_FAILURE;
+			goto exit_limit;
+		}
+
+		virtio_ve_add_cookie(ve, buf->tb_external_mapping[i].vbm_dmah,
+		    dmac, ncookies, B_TRUE);
+
+		nmp = nmp->b_cont;
+		i++;
+	}
+
+	buf->tb_external_num = i;
+	/* Save the mp to free it when the packet is sent. */
+	buf->tb_mp = mp;
+
+	return (DDI_SUCCESS);
+
+exit_limit:
+exit_bind:
+exit_lazy_alloc:
+	TRACE;
+	for (j = 0 ; j < i; j++)
+		(void) ddi_dma_unbind_handle(
+		    buf->tb_external_mapping[j].vbm_dmah);
+
+	return (ret);
+}
 static boolean_t
 vioif_send(struct vioif_softc *sc, mblk_t *mp)
 {
 	ddi_dma_cookie_t dmac;
 	struct vq_entry *ve;
-	struct vioif_buf *buf;
-	struct vq_entry *first_ve;
-	struct vq_entry *tmp_ve;
+	struct vioif_tx_buf *buf;
 	struct virtio_net_hdr *net_header;
-	struct vioif_buf *first_buf;
 	size_t msg_size = 0;
-	int frag_count = 0;
+	uint32_t csum_start;
+	uint32_t csum_stuff;
+	uint32_t csum_flags;
 	mblk_t *nmp;
 	int ret;
 	int i;
 
-	for (nmp = mp; nmp; nmp = nmp->b_cont) {
-		size_t frag_len = MBLKL(nmp);
-		if (frag_len) {
-			frag_count++;
-			msg_size += MBLKL(nmp);
-		}
-	}
+	for (nmp = mp; nmp; nmp = nmp->b_cont)
+		msg_size += MBLKL(nmp);
 
-	if (frag_count > 1)
-		cmn_err(CE_NOTE, "frag_count = %d, size = %lu",
-		    frag_count, msg_size);
 
+	/* XXX Better check that takes curent mtu and lso into account. */
 	if (msg_size > MAX_MTU) {
 		dev_err(sc->sc_dev, CE_WARN, "Message too big");
 		freemsg(mp);
 		return (B_TRUE);
 	}
 
-	first_ve = ve = vq_alloc_entry(sc->sc_tx_vq);
+	ve = vq_alloc_entry(sc->sc_tx_vq);
 	if (!ve) {
 		/* Out of free descriptors - try later. */
-		goto exit_alloc_ve;
+		return (B_FALSE);
 	}
 
-	/* Pre-allocate entries for the extra fragments. */
-	for(i = 1; i < frag_count; i++) {
-		tmp_ve = vq_alloc_entry(sc->sc_tx_vq);
-		if (!tmp_ve) {
-			goto exit_alloc_ve;
-		}
-		ve->qe_next = tmp_ve;
-		ve = tmp_ve;
-	}
-
-	buf = &sc->sc_txbufs[first_ve->qe_index];
+	buf = &sc->sc_txbufs[ve->qe_index];
 
 	/* Use the inline buffer of the first entry for the virtio_net_hdr. */
-	(void) memset(buf->b_buf, 0, sizeof (struct virtio_net_hdr));
+	(void) memset(buf->tb_inline_mapping.vbm_buf, 0,
+	    sizeof (struct virtio_net_hdr));
 
-	if (sc->sc_tx_csum) {
+	mac_hcksum_get(mp, &csum_start, &csum_stuff, NULL,
+	    NULL, &csum_flags);
 
-		uint32_t csum_start;
-		uint32_t csum_stuff;
-		uint32_t csum_flags;
+	/* They want us to do the TCP/UDP csum calculation. */
+	if (csum_flags & HCK_PARTIALCKSUM) {
+		struct ether_header *eth_header;
+		int eth_hsize;
 
-		mac_hcksum_get(mp, &csum_start, &csum_stuff, NULL,
-		    NULL, &csum_flags);
+		/* Did we ask for it? */
+		ASSERT(sc->sc_tx_csum);
 
-		/* They want us to do the TCP/UDP csum calculation. */
-		if (csum_flags & HCK_PARTIALCKSUM) {
-			struct ether_header *eth_header;
-			int eth_hsize;
+		/* We only asked for partial csum packets. */
+		ASSERT(!(csum_flags & HCK_IPV4_HDRCKSUM));
+		ASSERT(!(csum_flags & HCK_FULLCKSUM));
 
-			/* We only asked for partial csum packets. */
-			ASSERT(!(csum_flags & HCK_IPV4_HDRCKSUM));
-			ASSERT(!(csum_flags & HCK_FULLCKSUM));
-
-			eth_header = (void *) mp->b_rptr;
-			if (eth_header->ether_type == htons(ETHERTYPE_VLAN)) {
-				eth_hsize = sizeof (struct ether_vlan_header);
-			} else {
-				eth_hsize = sizeof (struct ether_header);
-			}
-
-			net_header = (struct virtio_net_hdr *)buf->b_buf;
-			net_header->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-			net_header->csum_start = eth_hsize + csum_start;
-			net_header->csum_offset = csum_stuff - csum_start;
+		eth_header = (void *) mp->b_rptr;
+		if (eth_header->ether_type == htons(ETHERTYPE_VLAN)) {
+			eth_hsize = sizeof (struct ether_vlan_header);
+		} else {
+			eth_hsize = sizeof (struct ether_header);
 		}
+
+		net_header = (struct virtio_net_hdr *)
+		    buf->tb_inline_mapping.vbm_buf;
+		net_header->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+		net_header->csum_start = eth_hsize + csum_start;
+		net_header->csum_offset = csum_stuff - csum_start;
 	}
 
-	virtio_ve_add_indirect_buf(first_ve, buf->b_dmac.dmac_laddress,
+	virtio_ve_add_indirect_buf(ve,
+	    buf->tb_inline_mapping.vbm_dmac.dmac_laddress,
 	    sizeof (struct virtio_net_hdr), B_TRUE);
 
 	/*
@@ -952,59 +1083,27 @@ vioif_send(struct vioif_softc *sc, mblk_t *mp)
 	 * get mapped using the mapped buffer.
 	 */
 	if (msg_size < sc->sc_txcopy_thresh) {
-		/* Frees mp */
-		mcopymsg(mp, buf->b_buf + sizeof (struct virtio_net_hdr));
-
-		virtio_ve_add_indirect_buf(first_ve,
-		    buf->b_dmac.dmac_laddress + sizeof (struct virtio_net_hdr),
-			msg_size, B_TRUE);
+		vioif_tx_inline(sc, ve, mp, msg_size);
 	} else {
-		nmp = mp;
-		/* Remember the mp to free it when the packet is sent. */
-		buf->b_mp = mp;
-		ve = first_ve;
-
-		while (nmp) {
-			size_t len;
-			len = MBLKL(nmp);
-			/*
-			 * The e1000g driver suggests there could be
-			 * zero-length fragments.
-			 */
-			if (len == 0) {
-				nmp = nmp->b_cont;
-				continue;
-			}
-			ASSERT(ve);
-			buf = &sc->sc_txbufs[ve->qe_index];
-
-			ret = ddi_dma_addr_bind_handle(buf->b_mapped_dmah,
-			   NULL, (caddr_t)nmp->b_rptr, len,
-			   DDI_DMA_WRITE | DDI_DMA_STREAMING,
-			   DDI_DMA_DONTWAIT, NULL, &dmac,
-			   &buf->b_mapped_ncookies);
-
-			virtio_ve_add_cookie(ve, buf->b_mapped_dmah, dmac,
-			    buf->b_mapped_ncookies, B_TRUE);
-
-			nmp = nmp->b_cont;
-			ve = ve->qe_next;
-		}
+		ret = vioif_tx_external(sc, ve, mp, msg_size);
+		if (ret != DDI_SUCCESS)
+			goto exit_tx_external;
 	}
 
-	virtio_push_chain(first_ve, B_TRUE);
+	virtio_push_chain(ve, B_TRUE);
 
 	return (B_TRUE);
 
-exit_alloc_ve:
-	ve = first_ve;
-	while (ve) {
-		tmp_ve = ve->qe_next;
-		vq_free_entry(sc->sc_tx_vq, ve);
-		ve = tmp_ve;
-	};
+exit_tx_external:
 
+	vq_free_entry(sc->sc_tx_vq, ve);
+	/*
+	 * vioif_tx_external can fail when the buffer does not fit into the
+	 * indirect descriptor table. Free the mp. I don't expect this ever
+	 * to happen.
+	 */
 	freemsg(mp);
+
 	return (B_TRUE);
 }
 
@@ -1375,29 +1474,22 @@ static void vioif_check_features(struct vioif_softc *sc)
 {
 	if (vioif_has_feature(sc, VIRTIO_NET_F_CSUM)) {
 		/* The GSO/GRO featured depend on CSUM, check them here. */
+		sc->sc_tx_csum = 1;
+		sc->sc_rx_csum = 1;
 
 		/*
 		 * Linux only checks for VIRTIO_NET_F_CSUM, so it's safe to
 		 * assume that they always come together. If not, we'd like
 		 * to know about it.
 		 */
-#if 0
 		if (!vioif_has_feature(sc, VIRTIO_NET_F_GUEST_CSUM)) {
 			dev_err(sc->sc_dev, CE_NOTE,
-			    "CSUM but !GUEST_CSUM. This is unexpected,"
-			    " not using hardware checksumming.");
-			goto exit_no_guest_csum;
+			    "CSUM but !GUEST_CSUM");
+			sc->sc_rx_csum = 0;
 		}
-#endif
 		cmn_err(CE_NOTE, "Csum enabled.");
 
-		sc->sc_tx_csum = 1;
-		sc->sc_rx_csum = 1;
 	}
-	cmn_err(CE_NOTE, "Csum not enabled");
-
-exit_no_guest_csum:
-	;
 }
 
 static int
@@ -1465,7 +1557,7 @@ vioif_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	vsc->sc_nvqs = vioif_has_feature(sc, VIRTIO_NET_F_CTRL_VQ) ? 3 : 2;
 
 	sc->sc_rxbuf_cache = kmem_cache_create("vioif_rx",
-	    sizeof (struct vioif_buf), 0,
+	    sizeof (struct vioif_rx_buf), 0,
 	    vioif_rx_construct, vioif_rx_destruct,
 	    NULL, sc, NULL, KM_SLEEP);
 	if (!sc->sc_rxbuf_cache) {
