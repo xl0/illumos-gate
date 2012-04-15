@@ -210,6 +210,7 @@ uint_t vq_num_used(struct virtqueue *vq);
 void virtio_stop_vq_intr(struct virtqueue *);
 void virtio_start_vq_intr(struct virtqueue *);
 
+unsigned int virtio_ve_indirect_available(struct vq_entry *qe);
 void virtio_ve_add_cookie(struct vq_entry *qe, ddi_dma_handle_t dma_handle,
     ddi_dma_cookie_t dma_cookie, unsigned int ncookies, boolean_t write);
 void virtio_ve_add_indirect_buf(struct vq_entry *qe, uint64_t paddr,

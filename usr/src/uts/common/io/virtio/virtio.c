@@ -688,6 +688,12 @@ virtio_ve_set(struct vq_entry *qe, uint64_t paddr, uint32_t len,
 	virtio_ve_set_desc(qe->qe_desc, paddr, len, write);
 }
 
+/* Get the number of unused indirect entries for this queue entry. */
+unsigned int virtio_ve_indirect_available(struct vq_entry *qe)
+{
+	return (qe->qe_queue->vq_indirect_num - (qe->qe_indirect_next - 1));
+}
+
 void
 virtio_ve_add_indirect_buf(struct vq_entry *qe, uint64_t paddr, uint32_t len,
     boolean_t write)
@@ -696,6 +702,15 @@ virtio_ve_add_indirect_buf(struct vq_entry *qe, uint64_t paddr, uint32_t len,
 
 	ASSERT(qe->qe_queue->vq_indirect_num);
 	ASSERT(qe->qe_indirect_next < qe->qe_queue->vq_indirect_num);
+
+	/*
+	 * QEMU gets really upset when we pass it obviously wrong buffers,
+	 * and responds by terminating, leaving no way to debug the
+	 * problem in the kernel. At least try to catch some errors here.
+	 */
+
+	ASSERT(paddr > 4096);
+	ASSERT(len != 0);
 
 	indirect_desc = &qe->qe_indirect_descs[qe->qe_indirect_next];
 	virtio_ve_set_desc(indirect_desc, paddr, len, write);
