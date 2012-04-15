@@ -263,12 +263,12 @@ struct vioif_softc {
 	struct virtqueue	*sc_tx_vq;
 	struct virtqueue	*sc_ctrl_vq;
 
-	unsigned int		sc_stopped:1;
 	unsigned int		sc_tx_stopped:1;
 
 	/* Feature bits. */
 	unsigned int 		sc_rx_csum:1;
 	unsigned int 		sc_tx_csum:1;
+	unsigned int		sc_tx_tso4:1;
 
 	int 			sc_mtu;
 	uint8_t			sc_mac[ETHERADDRL];
@@ -795,9 +795,11 @@ static int vioif_process_rx(struct vioif_softc *sc)
 	int i = 0;
 
 	while ((ve = virtio_pull_chain(sc->sc_rx_vq, &len))) {
+		struct virtio_net_hdr *net_hdr;
 
 		buf = sc->sc_rxbufs[ve->qe_index];
 		ASSERT(buf);
+		net_hdr = (void *) buf->rb_mapping.vbm_buf;
 
 		if (len < sizeof (struct virtio_net_hdr)) {
 			dev_err(sc->sc_dev, CE_WARN, "RX: Cnain too small: %u",
@@ -812,8 +814,8 @@ static int vioif_process_rx(struct vioif_softc *sc)
 		 * cookie and reuse the buffers. For bigger ones, we loan
 		 * the buffers upstream.
 		 */
-		if (len < sc->sc_rxcopy_thresh &&
-		    len < buf->rb_mapping.vbm_dmac.dmac_size) {
+		if (len < sc->sc_rxcopy_thresh /*&&
+		    len < buf->rb_mapping.vbm_dmac.dmac_size*/) {
 			mp = allocb(len, 0);
 			if (!mp) {
 				cmn_err(CE_WARN, "Failed to allocale mblock!");
@@ -875,9 +877,7 @@ static void vioif_reclaim_used_tx(struct vioif_softc *sc)
 				    buf->tb_external_mapping[i].vbm_dmah);
 		}
 
-		/* XXX Move after freemsg? */
 		virtio_free_chain(ve);
-
 
 		/* External mapping used, mp was not freed in vioif_send() */
 		if (mp)
@@ -1018,6 +1018,8 @@ vioif_send(struct vioif_softc *sc, mblk_t *mp)
 	uint32_t csum_start;
 	uint32_t csum_stuff;
 	uint32_t csum_flags;
+	uint32_t lso_flags;
+	uint32_t lso_mss;
 	mblk_t *nmp;
 	int ret;
 	int i;
@@ -1072,6 +1074,17 @@ vioif_send(struct vioif_softc *sc, mblk_t *mp)
 		net_header->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 		net_header->csum_start = eth_hsize + csum_start;
 		net_header->csum_offset = csum_stuff - csum_start;
+	}
+
+	mac_lso_get(mp, &lso_mss, &lso_flags);
+	if (lso_flags & HW_LSO) {
+		/* LSO requires checksums enabled. */
+		ASSERT(sc->sc_tx_csum);
+		/* Did we ask for it? */
+		ASSERT(sc->sc_tx_tso4);
+
+		net_header->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
+		net_header->gso_size = lso_mss;
 	}
 
 	virtio_ve_add_indirect_buf(ve,
@@ -1240,8 +1253,18 @@ vioif_getcapab(void *arg, mac_capab_t cap, void *cap_data)
 			*txflags = HCKSUM_INET_PARTIAL;
 			return (B_TRUE);
 		}
-		return (B_FALSE);
+	case MAC_CAPAB_LSO:
+		if (sc->sc_tx_tso4) {
+			mac_capab_lso_t *cap_lso = cap_data;
+
+			cap_lso->lso_flags = LSO_TX_BASIC_TCP_IPV4;
+			cap_lso->lso_basic_tcp_ipv4.lso_max = MAX_MTU;
+			return (B_TRUE);
+		}
+	default:
+		;
 	}
+
 
 	return (B_FALSE);
 }
@@ -1356,6 +1379,9 @@ vioif_dev_features(struct vioif_softc *sc)
 
 	host_features = virtio_negotiate_features(&sc->sc_virtio,
 	    VIRTIO_NET_F_CSUM |
+//	    VIRTIO_NET_F_GUEST_CSUM |
+	    VIRTIO_NET_F_HOST_TSO4 |
+	    VIRTIO_NET_F_HOST_ECN |
 	    VIRTIO_NET_F_MAC |
 	    VIRTIO_NET_F_STATUS |
 	    VIRTIO_F_RING_INDIRECT_DESC |
@@ -1477,18 +1503,30 @@ static void vioif_check_features(struct vioif_softc *sc)
 		sc->sc_tx_csum = 1;
 		sc->sc_rx_csum = 1;
 
-		/*
-		 * Linux only checks for VIRTIO_NET_F_CSUM, so it's safe to
-		 * assume that they always come together. If not, we'd like
-		 * to know about it.
-		 */
 		if (!vioif_has_feature(sc, VIRTIO_NET_F_GUEST_CSUM)) {
-			dev_err(sc->sc_dev, CE_NOTE,
-			    "CSUM but !GUEST_CSUM");
 			sc->sc_rx_csum = 0;
 		}
 		cmn_err(CE_NOTE, "Csum enabled.");
 
+		if (vioif_has_feature(sc, VIRTIO_NET_F_HOST_TSO4)) {
+
+			sc->sc_tx_tso4 = 1;
+			/*
+			* We don't seem to have a way to ask the system
+			* not to send us LSO packets with Explicit
+			* Congestion Notification bit set, so we require
+			* the device to support it in order to do
+			* LSO.
+			*/
+			if (!vioif_has_feature(sc, VIRTIO_NET_F_HOST_ECN)) {
+				dev_err(sc->sc_dev, CE_NOTE,
+				    "TSO4 supported, but not ECN. "
+				    "Not using LSO.");
+				sc->sc_tx_tso4 = 0;
+			} else {
+				cmn_err(CE_NOTE, "LSO enabled");
+			}
+		}
 	}
 }
 
